@@ -1,4 +1,4 @@
-package ringbuffer
+package cirque
 
 import (
 	"container/ring"
@@ -7,51 +7,51 @@ import (
 	"unsafe"
 )
 
-type RingBuffer[T any] struct {
+type Cirque[T any] struct {
 	writeHead *ring.Ring    // Writer head position pointer
 	readHead  *ring.Ring    // Reader head position pointer
 	mu        sync.Mutex    // Mutex lock for reads only
 	updateCh  chan struct{} // Channel used as a condition variable when writer head is waiting for reader head to move.
 }
 
-// New creates a RingBuffer of fixed size n with items of type T.
-func New[T any](n int) *RingBuffer[T] {
+// New creates a Cirque of fixed size n with items of type T.
+func New[T any](n int) *Cirque[T] {
 	if n <= 0 {
 		return nil
 	}
-	or := new(RingBuffer[T])
+	or := new(Cirque[T])
 	or.readHead = ring.New(n)
 	or.writeHead = or.readHead
 	or.updateCh = make(chan struct{})
 	return or
 }
 
-func (rb *RingBuffer[T]) loadHead(head **ring.Ring) *ring.Ring {
+func (cq *Cirque[T]) loadHead(head **ring.Ring) *ring.Ring {
 	return (*ring.Ring)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(head))))
 }
 
-func (rb *RingBuffer[T]) getReaderHead() *ring.Ring {
-	return rb.loadHead(&rb.readHead)
+func (cq *Cirque[T]) getReaderHead() *ring.Ring {
+	return cq.loadHead(&cq.readHead)
 }
 
-func (rb *RingBuffer[T]) getWriterHead() *ring.Ring {
-	return rb.loadHead(&rb.writeHead)
+func (cq *Cirque[T]) getWriterHead() *ring.Ring {
+	return cq.loadHead(&cq.writeHead)
 }
 
-func (rb *RingBuffer[T]) moveHeadForward(head **ring.Ring) {
+func (cq *Cirque[T]) moveHeadForward(head **ring.Ring) {
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(head)), unsafe.Pointer((*head).Next()))
 }
 
-func (rb *RingBuffer[T]) moveWriterHeadForward() {
-	rb.moveHeadForward(&rb.writeHead)
+func (cq *Cirque[T]) moveWriterHeadForward() {
+	cq.moveHeadForward(&cq.writeHead)
 }
 
-func (rb *RingBuffer[T]) moveReaderHeadForward() {
-	rb.moveHeadForward(&rb.readHead)
+func (cq *Cirque[T]) moveReaderHeadForward() {
+	cq.moveHeadForward(&cq.readHead)
 
 	// Notify writer head if it is blocked, otherwise ignore if it's not listening.
 	select {
-	case rb.updateCh <- struct{}{}:
+	case cq.updateCh <- struct{}{}:
 	default:
 	}
 }
@@ -61,8 +61,8 @@ func (rb *RingBuffer[T]) moveReaderHeadForward() {
 // its head currently is. Writer head moves are atomic.
 // So, writing a value does not really present a race condition as far as I can tell.
 // However, to be sure I am saving the value atomically anyway.
-func (rb *RingBuffer[T]) write(item T) {
-	h := rb.getWriterHead()
+func (cq *Cirque[T]) write(item T) {
+	h := cq.getWriterHead()
 
 	if h.Value == nil {
 		h.Value = &atomic.Value{}
@@ -72,29 +72,29 @@ func (rb *RingBuffer[T]) write(item T) {
 }
 
 // Read from current position.
-func (rb *RingBuffer[T]) read() T {
-	return rb.getReaderHead().Value.(*atomic.Value).Load().(T)
+func (cq *Cirque[T]) read() T {
+	return cq.getReaderHead().Value.(*atomic.Value).Load().(T)
 }
 
 // WriteOrWait gets a slice of items as input, and it returns when all items have been written.
-func (rb *RingBuffer[T]) WriteOrWait(newItems []T) {
+func (cq *Cirque[T]) WriteOrWait(newItems []T) {
 	for _, item := range newItems {
 		// If the writer head is next to the reader head the buffer does not write anymore.
 		// Wait for the reader head to signal a move by writing to the channel.
-		if rb.getWriterHead().Next() == rb.getReaderHead() {
-			<-rb.updateCh
+		if cq.getWriterHead().Next() == cq.getReaderHead() {
+			<-cq.updateCh
 		}
 
 		// Write data in the current position.
-		rb.write(item)
+		cq.write(item)
 
 		// Move writer head to the next position.
-		rb.moveWriterHeadForward()
+		cq.moveWriterHeadForward()
 	}
 }
 
 // Read gets a maximum number of items as input, and it returns a slice of items.
-func (rb *RingBuffer[T]) Read(n int) []T {
+func (cq *Cirque[T]) Read(n int) []T {
 	if n <= 0 {
 		return nil
 	}
@@ -102,20 +102,20 @@ func (rb *RingBuffer[T]) Read(n int) []T {
 	// Temporary slice to populate with results
 	var result []T
 
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
 
 	for i := 0; i < n; i++ {
 		// If reader head is in the same place as writer head no data is available to read.
-		if rb.getReaderHead() == rb.getWriterHead() {
+		if cq.getReaderHead() == cq.getWriterHead() {
 			return result
 		}
 
 		// Read from current position.
-		result = append(result, rb.read())
+		result = append(result, cq.read())
 
 		// Move reader head to the next position.
-		rb.moveReaderHeadForward()
+		cq.moveReaderHeadForward()
 	}
 
 	return result
