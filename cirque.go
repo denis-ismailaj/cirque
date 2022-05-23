@@ -2,28 +2,43 @@ package cirque
 
 import (
 	"container/ring"
+	"log"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 )
 
 type Cirque[T any] struct {
-	writeHead *ring.Ring    // Writer head position pointer
-	readHead  *ring.Ring    // Reader head position pointer
-	mu        sync.Mutex    // Mutex lock for reads only
-	updateCh  chan struct{} // Channel used as a condition variable when writer head is waiting for reader head to move.
+	writeHead *ring.Ring // Writer head position pointer
+	readHead  *ring.Ring // Reader head position pointer
+	readMu    sync.Mutex // Mutex lock for reads only
+	len       int        // Number of items in queue
+	cap       int        // Capacity of queue
 }
 
-// New creates a Cirque of fixed size n with items of type T.
+// New creates a Cirque of initial size n with items of type T.
 func New[T any](n int) *Cirque[T] {
 	if n <= 0 {
 		return nil
 	}
-	or := new(Cirque[T])
-	or.readHead = ring.New(n)
-	or.writeHead = or.readHead
-	or.updateCh = make(chan struct{})
-	return or
+	cq := new(Cirque[T])
+
+	// Saving capacity in the struct itself.
+	// This can be calculated by calling Ring.Len(), but that has O(n) complexity.
+	// By saving the capacity from the start we can lower that to O(1).
+	cq.cap = n
+
+	// Create heads
+	cq.readHead = ring.New(n)
+	cq.writeHead = cq.readHead
+
+	return cq
+}
+
+// Len returns the number of items currently in the queue.
+// Because this is updated on every operation, this method offers O(1) complexity.
+func (cq *Cirque[T]) Len() int {
+	return cq.len
 }
 
 func (cq *Cirque[T]) loadHead(head **ring.Ring) *ring.Ring {
@@ -48,53 +63,61 @@ func (cq *Cirque[T]) moveWriterHeadForward() {
 
 func (cq *Cirque[T]) moveReaderHeadForward() {
 	cq.moveHeadForward(&cq.readHead)
-
-	// Notify writer head if it is blocked, otherwise ignore if it's not listening.
-	select {
-	case cq.updateCh <- struct{}{}:
-	default:
-	}
 }
 
-// A reader does not read if its head is in the same place as the writer head.
-// The writer head does not move to another position until after it has finished modifying the value where
-// its head currently is. Writer head moves are atomic.
-// So, writing a value does not really present a race condition as far as I can tell.
-// However, to be sure I am saving the value atomically anyway.
+// Write to the current position
 func (cq *Cirque[T]) write(item T) {
 	h := cq.getWriterHead()
-
-	if h.Value == nil {
-		h.Value = &atomic.Value{}
-	}
-
-	h.Value.(*atomic.Value).Store(item)
+	h.Value = item
 }
 
 // Read from current position.
 func (cq *Cirque[T]) read() T {
-	return cq.getReaderHead().Value.(*atomic.Value).Load().(T)
+	return cq.getReaderHead().Value.(T)
 }
 
-// WriteOrWait gets a slice of items as input, and it returns when all items have been written.
-func (cq *Cirque[T]) WriteOrWait(newItems []T) {
-	for _, item := range newItems {
-		// If the writer head is next to the reader head the buffer does not write anymore.
-		// Wait for the reader head to signal a move by writing to the channel.
+func (cq *Cirque[T]) grow(min int) {
+	if min < 0 {
+		log.Printf("Tried to call grow on Cirque with min of %d.\n", min)
+		return
+	}
+	cq.readMu.Lock()
+	defer cq.readMu.Unlock()
+
+	// Create new ring to (more than) double current capacity
+	newRing := ring.New(min)
+
+	// Join rings together
+	cq.writeHead.Link(newRing)
+
+	// Update capacity
+	cq.cap += min
+}
+
+// Enqueue adds the input elements to the queue
+func (cq *Cirque[T]) Enqueue(elements ...T) {
+	for _, item := range elements {
+		// If the writer head is next to the reader head the queue is full.
 		if cq.getWriterHead().Next() == cq.getReaderHead() {
-			<-cq.updateCh
+			// grow is a blocking call here, and since we assume a single writer
+			// this is safe to do without a lock for writes.
+			minSize := cq.cap + len(elements)
+			cq.grow(minSize)
 		}
 
 		// Write data in the current position.
 		cq.write(item)
+
+		// Update length
+		cq.len++
 
 		// Move writer head to the next position.
 		cq.moveWriterHeadForward()
 	}
 }
 
-// Read gets a maximum number of items as input, and it returns a slice of items.
-func (cq *Cirque[T]) Read(n int) []T {
+// Dequeue returns a maximum of n items from the queue.
+func (cq *Cirque[T]) Dequeue(n int) []T {
 	if n <= 0 {
 		return nil
 	}
@@ -102,8 +125,8 @@ func (cq *Cirque[T]) Read(n int) []T {
 	// Temporary slice to populate with results
 	var result []T
 
-	cq.mu.Lock()
-	defer cq.mu.Unlock()
+	cq.readMu.Lock()
+	defer cq.readMu.Unlock()
 
 	for i := 0; i < n; i++ {
 		// If reader head is in the same place as writer head no data is available to read.
@@ -111,8 +134,11 @@ func (cq *Cirque[T]) Read(n int) []T {
 			return result
 		}
 
-		// Read from current position.
+		// Dequeue from current position.
 		result = append(result, cq.read())
+		
+		// Update length
+		cq.len--		
 
 		// Move reader head to the next position.
 		cq.moveReaderHeadForward()
