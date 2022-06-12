@@ -2,12 +2,14 @@ package cirque
 
 import (
 	"container/ring"
-	"log"
+	log "github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 )
 
+// Cirque is a FIFO queue backed by a circular list (Ring from container/ring) that enables
+// independent reads and writes.
 type Cirque[T any] struct {
 	writeHead *ring.Ring // Writer head position pointer
 	readHead  *ring.Ring // Reader head position pointer
@@ -76,9 +78,10 @@ func (cq *Cirque[T]) read() T {
 	return cq.getReaderHead().Value.(T)
 }
 
+// Raise the capacity of the Cirque by modifying the underlying ring.
 func (cq *Cirque[T]) grow(min int) {
 	if min < 0 {
-		log.Printf("Tried to call grow on Cirque with min of %d.\n", min)
+		log.Warningf("Tried to call grow with invalid min: %d.", min)
 		return
 	}
 	cq.readMu.Lock()
@@ -92,10 +95,13 @@ func (cq *Cirque[T]) grow(min int) {
 
 	// Update capacity
 	cq.cap += min
+
+	log.Debugf("Grew capacity to %d.", cq.cap)
 }
 
 // Enqueue adds the input elements to the queue
 func (cq *Cirque[T]) Enqueue(elements ...T) {
+	log.Debugf("Enqueuing %d items.", len(elements))
 	for _, item := range elements {
 		// If the writer head is next to the reader head the queue is full.
 		if cq.getWriterHead().Next() == cq.getReaderHead() {
@@ -136,13 +142,14 @@ func (cq *Cirque[T]) Dequeue(n int) []T {
 
 		// Dequeue from current position.
 		result = append(result, cq.read())
-		
+
 		// Update length
-		cq.len--		
+		cq.len--
 
 		// Move reader head to the next position.
 		cq.moveReaderHeadForward()
 	}
 
+	log.Debugf("Dequeuing %d items.", len(result))
 	return result
 }
